@@ -1,0 +1,125 @@
+name: Release plugin
+
+on:
+  push:
+    tags:
+      - "*-v*"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, publish, and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run package tests
+        run: npm test --workspaces --if-present
+
+      - name: Resolve package from tag
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^(.+)-v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+            echo "Tag must look like <npm-package-name>-v<semver>, got: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          PACKAGE_NAME="${BASH_REMATCH[1]}"
+          PACKAGE_VERSION="${BASH_REMATCH[2]}"
+          export PACKAGE_NAME
+
+          PACKAGE_DIR="$(
+            node --input-type=module -e '
+              import fs from "node:fs";
+              const name = process.env.PACKAGE_NAME;
+              const dir = fs.readdirSync("packages").find((entry) => {
+                const file = `packages/${entry}/package.json`;
+                return fs.existsSync(file) && JSON.parse(fs.readFileSync(file, "utf8")).name === name;
+              });
+              if (!dir) {
+                console.error(`No workspace package named ${name}`);
+                process.exit(1);
+              }
+              process.stdout.write(`packages/${dir}`);
+            '
+          )"
+
+          ACTUAL_VERSION="$(node -p "require('./${PACKAGE_DIR}/package.json').version")"
+          if [[ "${ACTUAL_VERSION}" != "${PACKAGE_VERSION}" ]]; then
+            echo "Tag version ${PACKAGE_VERSION} does not match ${PACKAGE_DIR}/package.json version ${ACTUAL_VERSION}" >&2
+            exit 1
+          fi
+
+          {
+            echo "name=${PACKAGE_NAME}"
+            echo "version=${PACKAGE_VERSION}"
+            echo "dir=${PACKAGE_DIR}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published; skipping npm publish."
+            exit 0
+          fi
+
+          PUBLISH_ARGS=(--workspace "${PACKAGE_NAME}")
+          if [[ "${PACKAGE_NAME}" == @* ]]; then
+            PUBLISH_ARGS+=(--access public)
+          fi
+          npm publish "${PUBLISH_ARGS[@]}"
+
+      - name: Pack release artifact
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          npm pack --workspace "${PACKAGE_NAME}" --pack-destination release
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release/*.tgz --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${TAG}" release/*.tgz \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${PACKAGE_NAME} v${PACKAGE_VERSION}" \
+              --generate-notes \
+              --verify-tag
+          fi
