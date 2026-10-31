@@ -14,4 +14,3 @@ magpie 插件集合。每个插件位于 packages/ 下，拥有独立的 package
 npm run check:amd-tokenfactory
 npm run test:amd-tokenfactory
 ~~~
-
