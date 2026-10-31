@@ -1,0 +1,17 @@
+{
+  "name": "magpie-plugins",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check:amd-tokenfactory": "node --check packages/amd-tokenfactory/index.mjs && node --check packages/amd-tokenfactory/index.test.mjs",
+    "test:amd-tokenfactory": "node packages/amd-tokenfactory/index.test.mjs",
+    "publish:amd-tokenfactory": "npm publish --workspace magpie-plugin-amd-tokenfactory"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

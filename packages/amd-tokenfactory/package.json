@@ -1,0 +1,35 @@
+{
+  "name": "magpie-plugin-amd-tokenfactory",
+  "version": "0.1.0",
+  "description": "Magpie provider plugin for AMD TokenFactory (Radeon Cloud)",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "GLOSSARY.md"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "amd",
+    "tokenfactory",
+    "provider"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qiufengwentian/magpie-plugins.git",
+    "directory": "packages/amd-tokenfactory"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "magpie": {
+    "maxConcurrency": 4
+  },
+  "scripts": {
+    "test": "node index.test.mjs"
+  }
+}
