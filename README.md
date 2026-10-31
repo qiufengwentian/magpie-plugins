@@ -22,14 +22,15 @@ npm run test:amd-tokenfactory
 npm 要求包已存在才能配置 Trusted Publisher，因此首次发布新包需要先手动发布一次，再配置 GitHub 仓库；之后推送 tag 即可由 GitHub Actions 自动发布：
 
 ~~~bash
-npm login
-npm publish --workspace magpie-plugin-amd-tokenfactory
+npm login --registry=https://registry.npmjs.org
+npm publish --workspace magpie-plugin-amd-tokenfactory --registry=https://registry.npmjs.org
 
 # 需要 npm CLI 11.15+
 npm trust github magpie-plugin-amd-tokenfactory \
   --file release.yml \
   --repo qiufengwentian/magpie-plugins \
-  --allow-publish
+  --allow-publish \
+  --registry=https://registry.npmjs.org
 ~~~
 
 后续发布先把 `packages/<name>/package.json` 的 version 改为新版本，再推送格式为 `<npm 包名>-v<semver>` 的 tag。工作流会校验 tag 与 version 一致、运行全仓库测试、通过 OIDC 发布到 npm，并创建 GitHub Release：
