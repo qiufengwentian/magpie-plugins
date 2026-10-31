@@ -31,8 +31,6 @@ magpie plugin add /path/to/magpie-plugins/packages/amd-tokenfactory
 
 从 git 仓库安装时，把上面的本地路径换成仓库中的 `packages/amd-tokenfactory` 目录即可。
 
-> **重要：不要与社区插件 magpie-plugin-amd 同时启用。** 两者都注册 provider id `amd`，后加载的 auth 钩子会覆盖前者。请只保留一个。
-
 ## 登录
 
 插件提供一个“粘贴 API key”的登录入口：
