@@ -25,6 +25,8 @@ const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
 
+const PROBE_CONCURRENCY = 4;
+
 const DEFAULT_CONTEXT_WINDOW = 131072;
 const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 const THINKING_MIN_OUTPUT_TOKENS = 16384;
@@ -403,6 +405,50 @@ function authError(message) {
   return Object.assign(gatewayError(401, message), { signIn: "expired" });
 }
 
+/**
+ * Probe one API key with a single GET /models request. The verdict is decided by
+ * the HTTP status only: 2xx alive, 401/403 invalid, everything else unverified.
+ * Alive results carry the raw response so the model catalog can be reused later
+ * without a second request.
+ */
+async function probeKey(key, baseURL) {
+  let response;
+  try {
+    response = await fetchWithRetry(trimSlash(baseURL) + "/models", {
+      method: "GET",
+      headers: {
+        Authorization: "Bearer " + key,
+        "Content-Type": "application/json",
+      },
+    });
+  } catch {
+    return { key, state: "unknown" };
+  }
+
+  const status = response.status;
+  if (response.ok) return { key, state: "alive", status, response };
+  await cancelBody(response);
+  if (status === 401 || status === 403) return { key, state: "invalid", status };
+  return { key, state: "unknown", status };
+}
+
+/**
+ * Probe every key in the pool, keeping at most PROBE_CONCURRENCY requests in
+ * flight. Results keep the input order.
+ */
+async function probeKeys(keys, baseURL) {
+  const results = new Array(keys.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < keys.length) {
+      const index = nextIndex++;
+      results[index] = await probeKey(keys[index], baseURL);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, keys.length) }, worker));
+  return results;
+}
+
 function summarizeFleetLoad(load) {
   if (!isPlainObject(load) || !load.models) return "";
   let entries;
@@ -613,41 +659,40 @@ export const AmdPlugin = async ({ client } = {}) => {
     throw lastError ?? gatewayError(502, "模型目录查询失败");
   };
 
-  const validateFirstKey = async (keys, baseURL) => {
-    let response;
-    try {
-      response = await fetchWithRetry(trimSlash(baseURL) + "/models", {
-        method: "GET",
-        headers: {
-          Authorization: "Bearer " + keys[0],
-          "Content-Type": "application/json",
-        },
-      });
-    } catch (error) {
-      throw gatewayError(502, "网络请求失败（网络错误）：" + (error?.message ?? error));
+  const probePool = async (keys, baseURL) => {
+    const results = await probeKeys(keys, baseURL);
+    const invalid = results.filter((result) => result.state === "invalid");
+    const unknown = results.filter((result) => result.state === "unknown");
+    const alive = results.filter((result) => result.state === "alive");
+
+    if (alive.length === 0) {
+      if (keys.length === 1) {
+        const [only] = results;
+        if (only.state === "invalid") {
+          throw authError("API Key 无效或已过期（HTTP " + only.status + "）");
+        }
+        if (only.status !== undefined) {
+          throw gatewayError(only.status, "key 校验失败：HTTP " + only.status);
+        }
+        throw gatewayError(502, "key 校验失败：超时或网络异常");
+      }
+      if (unknown.length === 0) {
+        throw authError("所有 " + keys.length + " 个 API Key 均无效或已过期，请重新登录");
+      }
+      throw gatewayError(
+        502,
+        "key 探活失败：" +
+          keys.length +
+          " 个 key 均未通过（" +
+          invalid.length +
+          " 个无效，" +
+          unknown.length +
+          " 个未出结论）",
+      );
     }
 
-    if (response.status === 401 || response.status === 403) {
-      await cancelBody(response);
-      throw authError("API Key 无效或已过期（HTTP " + response.status + "）");
-    }
-    if (!response.ok) {
-      const status = response.status;
-      await cancelBody(response);
-      throw gatewayError(status, "key 校验失败：HTTP " + status);
-    }
-
-    let payload;
-    try {
-      payload = await response.json();
-    } catch {
-      throw gatewayError(502, "模型目录返回的 JSON 无法解析");
-    }
-    if (catalogRows(payload).length === 0) {
-      throw gatewayError(502, "key 有效但模型目录为空或格式无法识别");
-    }
-    catalogCache.set(cacheKeyOf(baseURL, keys), { payload, fetchedAt: Date.now() });
-    return payload;
+    const pool = results.filter((result) => result.state !== "invalid").map((result) => result.key);
+    return { results, pool, invalid, unknown };
   };
 
   const fetchFleetLoad = async () => {
@@ -849,23 +894,39 @@ export const AmdPlugin = async ({ client } = {}) => {
               throw gatewayError(400, "请至少填写一个 AMD TokenFactory API Key");
             }
             const baseURL = configuredBaseUrl || resolveBaseUrl();
-            await validateFirstKey(keys, baseURL);
+            const { pool, invalid, unknown } = await probePool(keys, baseURL);
 
             const note = String(inputs?.note ?? "").trim();
             const accountId =
-              note || "AMD " + maskApiKey(keys[0]) + (keys.length > 1 ? " +" + (keys.length - 1) : "");
-            log("已配置 " + keys.length + " 个 API key");
+              note || "AMD " + maskApiKey(pool[0]) + (pool.length > 1 ? " +" + (pool.length - 1) : "");
+            log(
+              "已配置 " +
+                pool.length +
+                " 个 API key（剔除 " +
+                invalid.length +
+                " 个，未验证 " +
+                unknown.length +
+                " 个）",
+            );
+
+            const detail = [
+              invalid.length > 0 ? invalid.length + " 个无效已剔除" : "",
+              unknown.length > 0 ? unknown.length + " 个未验证" : "",
+            ].filter(Boolean);
 
             return {
               url: "",
               method: "auto",
               instructions:
                 keys.length > 1
-                  ? "已配置 " + keys.length + " 个 AMD TokenFactory API key，请求将轮换使用。"
-                  : "已配置 AMD TokenFactory API key（" + maskApiKey(keys[0]) + "）。",
+                  ? "已配置 " +
+                    pool.length +
+                    " 个 AMD TokenFactory API key，请求将轮换使用。" +
+                    (detail.length > 0 ? "（" + detail.join("，") + "）" : "")
+                  : "已配置 AMD TokenFactory API key（" + maskApiKey(pool[0]) + "）。",
               callback: async () => ({
                 type: "success",
-                access: serializeKeyPool(keys),
+                access: serializeKeyPool(pool),
                 refresh: "",
                 accountId,
               }),
