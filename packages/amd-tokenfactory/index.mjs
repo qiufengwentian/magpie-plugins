@@ -26,6 +26,9 @@ const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
 
 const PROBE_CONCURRENCY = 4;
+const PROBE_TIMEOUT_MS = 5 * 1000;
+const PROBE_BUDGET_MS = 10 * 1000;
+const PROBE_MAX_RETRY_DELAY_MS = 1000;
 
 const DEFAULT_CONTEXT_WINDOW = 131072;
 const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
@@ -73,6 +76,11 @@ function resolveBaseUrl(provider) {
 
 function resolveLoadUrl() {
   return trimSlash(process.env.AMD_TOKENFACTORY_LOAD_URL) || DEFAULT_LOAD_URL;
+}
+
+function envDurationMs(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function isPlainObject(value) {
@@ -338,12 +346,12 @@ function getRetryAfterMs(response) {
   return delta > 0 ? delta : undefined;
 }
 
-function calculateRetryDelay(attempt, retryAfter) {
+function calculateRetryDelay(attempt, retryAfter, maxDelayMs = MAX_RETRY_DELAY_MS) {
   if (retryAfter !== undefined && retryAfter > 0) {
-    return Math.min(Math.round(retryAfter * (0.9 + Math.random() * 0.2)), MAX_RETRY_DELAY_MS);
+    return Math.min(Math.round(retryAfter * (0.9 + Math.random() * 0.2)), maxDelayMs);
   }
   const exponential = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-  return Math.round(Math.random() * Math.min(exponential, MAX_RETRY_DELAY_MS));
+  return Math.round(Math.random() * Math.min(exponential, maxDelayMs));
 }
 
 function sleep(ms, signal) {
@@ -373,7 +381,7 @@ async function cancelBody(response) {
   }
 }
 
-async function fetchWithRetry(url, init = {}) {
+async function fetchWithRetry(url, init = {}, maxRetryDelayMs = MAX_RETRY_DELAY_MS) {
   let lastError;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
@@ -383,12 +391,12 @@ async function fetchWithRetry(url, init = {}) {
       if (attempt === MAX_ATTEMPTS - 1) return response;
       const retryAfter = getRetryAfterMs(response);
       await cancelBody(response);
-      await sleep(calculateRetryDelay(attempt, retryAfter), init.signal);
+      await sleep(calculateRetryDelay(attempt, retryAfter, maxRetryDelayMs), init.signal);
     } catch (error) {
       if (init.signal?.aborted) throw error;
       lastError = error;
       if (attempt < MAX_ATTEMPTS - 1) {
-        await sleep(calculateRetryDelay(attempt), init.signal);
+        await sleep(calculateRetryDelay(attempt, undefined, maxRetryDelayMs), init.signal);
       }
     }
   }
@@ -412,17 +420,27 @@ function authError(message) {
  * without a second request.
  */
 async function probeKey(key, baseURL) {
+  const timeoutMs = envDurationMs("AMD_TOKENFACTORY_PROBE_TIMEOUT_MS", PROBE_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
-    response = await fetchWithRetry(trimSlash(baseURL) + "/models", {
-      method: "GET",
-      headers: {
-        Authorization: "Bearer " + key,
-        "Content-Type": "application/json",
+    response = await fetchWithRetry(
+      trimSlash(baseURL) + "/models",
+      {
+        method: "GET",
+        headers: {
+          Authorization: "Bearer " + key,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
       },
-    });
+      PROBE_MAX_RETRY_DELAY_MS,
+    );
   } catch {
     return { key, state: "unknown" };
+  } finally {
+    clearTimeout(timer);
   }
 
   const status = response.status;
@@ -434,13 +452,22 @@ async function probeKey(key, baseURL) {
 
 /**
  * Probe every key in the pool, keeping at most PROBE_CONCURRENCY requests in
- * flight. Results keep the input order.
+ * flight. Results keep the input order. Keys that have not started when the
+ * total budget runs out are reported as unverified without a request.
  */
 async function probeKeys(keys, baseURL) {
   const results = new Array(keys.length);
+  const deadline = Date.now() + envDurationMs("AMD_TOKENFACTORY_PROBE_BUDGET_MS", PROBE_BUDGET_MS);
   let nextIndex = 0;
   const worker = async () => {
     while (nextIndex < keys.length) {
+      if (Date.now() >= deadline) {
+        while (nextIndex < keys.length) {
+          const index = nextIndex++;
+          results[index] = { key: keys[index], state: "unknown" };
+        }
+        return;
+      }
       const index = nextIndex++;
       results[index] = await probeKey(keys[index], baseURL);
     }

@@ -403,6 +403,142 @@ describe("登录探活", () => {
   });
 });
 
+describe("登录探活超时与总预算", () => {
+  const KEY_A = "probe-timeout-key-abcdefghijkl";
+  const PROBE_TIMEOUT_ENV = "AMD_TOKENFACTORY_PROBE_TIMEOUT_MS";
+  const PROBE_BUDGET_ENV = "AMD_TOKENFACTORY_PROBE_BUDGET_MS";
+
+  async function withProbeEnv(overrides, run) {
+    const saved = {};
+    for (const [name, value] of Object.entries(overrides)) {
+      saved[name] = process.env[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    try {
+      return await run();
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  const probeCountOf = (key) =>
+    requests.filter((request) => request.headers.authorization === "Bearer " + key).length;
+
+  it("单 key 超时后报超时或网络异常，不会无限等待", { timeout: 3000 }, async () => {
+    handler = () => {};
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const error = await withProbeEnv({ [PROBE_TIMEOUT_ENV]: "60" }, () =>
+      loginFailure(plugin, { keys: KEY_A }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(error.message, "key 校验失败：超时或网络异常");
+    assert.notEqual(error.signIn, "expired");
+    assert.equal(requests.length, 1);
+    assert.ok(elapsed >= 50, "应等待压缩后的单 key 超时（实际 " + elapsed + "ms）");
+    assert.ok(elapsed < 2000, "不应无限等待（实际 " + elapsed + "ms）");
+  });
+
+  it("总预算到点后未开工的 key 记为未验证且不再发请求", { timeout: 5000 }, async () => {
+    const keys = Array.from(
+      { length: 6 },
+      (_, index) => "probe-budget-key-" + index + "-abcdefghijkl",
+    );
+    handler = async (req, res) => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const { start, result } = await withProbeEnv({ [PROBE_BUDGET_ENV]: "50" }, async () => {
+      const start = await startLogin(plugin, { keys: keys.join(",") });
+      return { start, result: await start.callback() };
+    });
+    const elapsed = Date.now() - started;
+
+    assert.deepEqual(JSON.parse(result.access), keys);
+    assert.match(start.instructions, /2 个未验证/);
+    assert.equal(requests.length, 4);
+    assert.equal(probeCountOf(keys[4]), 0);
+    assert.equal(probeCountOf(keys[5]), 0);
+    assert.ok(elapsed < 1500, "预算到点后不应等待未开工的 key（实际 " + elapsed + "ms）");
+  });
+
+  it("503 两次后第三次成功：退避封顶 1 秒，总耗时落在单 key 超时内", { timeout: 8000 }, async () => {
+    let attempts = 0;
+    handler = (req, res) => {
+      attempts++;
+      if (attempts < 3) {
+        sendJson(res, 503, { error: "busy" }, { "retry-after": "3" });
+        return;
+      }
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const result = await withProbeEnv(
+      { [PROBE_TIMEOUT_ENV]: undefined, [PROBE_BUDGET_ENV]: undefined },
+      () => login(plugin, { keys: KEY_A }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(result.type, "success");
+    assert.equal(attempts, 3);
+    assert.ok(elapsed < 5000, "3 次尝试应落在 5 秒单 key 超时内（实际 " + elapsed + "ms）");
+  });
+
+  it("环境变量缺失时按生产默认值探活，不提前超时也不跳过 key", { timeout: 5000 }, async () => {
+    const keys = Array.from(
+      { length: 5 },
+      (_, index) => "probe-default-key-" + index + "-abcdefghijkl",
+    );
+    handler = async (req, res) => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const { plugin } = await makePlugin();
+    const result = await withProbeEnv(
+      { [PROBE_TIMEOUT_ENV]: undefined, [PROBE_BUDGET_ENV]: undefined },
+      () => login(plugin, { keys: keys.join(",") }),
+    );
+
+    assert.deepEqual(JSON.parse(result.access), keys);
+    assert.equal(requests.length, 5);
+  });
+
+  it("模型目录请求的退避仍按 30 秒封顶，不受探活 1 秒封顶影响", { timeout: 8000 }, async () => {
+    let attempts = 0;
+    handler = (req, res) => {
+      attempts++;
+      if (attempts === 1) {
+        sendJson(res, 503, { error: "busy" }, { "retry-after": "2" });
+        return;
+      }
+      sendJson(res, 200, {
+        data: [
+          { id: "m1", architecture: { input_modalities: ["text"], output_modalities: ["text"] } },
+        ],
+      });
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const models = await withProbeEnv(
+      { [PROBE_TIMEOUT_ENV]: undefined, [PROBE_BUDGET_ENV]: undefined },
+      () => plugin.provider.models(makeProvider(), { auth: makeAuth(["catalog-retry-key"]) }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(models.m1.id, "m1");
+    assert.equal(attempts, 2);
+    assert.ok(elapsed >= 1500, "模型目录路径应尊重 Retry-After 2 秒（实际 " + elapsed + "ms）");
+  });
+});
+
 describe("请求链路与网关兼容层", () => {
   it("注入 key、删除旧认证头并重写请求体", async () => {
     handler = (req, res) => sendJson(res, 200, { ok: true });
