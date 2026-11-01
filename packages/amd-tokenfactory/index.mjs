@@ -695,6 +695,28 @@ export const AmdPlugin = async ({ client } = {}) => {
     return { results, pool, invalid, unknown };
   };
 
+  /**
+   * Reuse the probe responses as the model catalog: parse the first alive body and
+   * seed the catalog cache under the final pool, so opening the model picker right
+   * after sign-in costs no extra request. Unused bodies are released and catalog
+   * failures stay silent — sign-in never depends on the catalog being readable.
+   */
+  const warmCatalogCache = async (results, pool, baseURL) => {
+    const alive = results.filter((result) => result.state === "alive");
+    const [first, ...unused] = alive;
+    await Promise.all(unused.map((result) => cancelBody(result.response)));
+    if (!first) return;
+
+    try {
+      const payload = await first.response.json();
+      if (catalogRows(payload).length > 0) {
+        catalogCache.set(cacheKeyOf(baseURL, pool), { payload, fetchedAt: Date.now() });
+      }
+    } catch {
+      // An unreadable catalog must not block sign-in; provider.models refetches on its own.
+    }
+  };
+
   const fetchFleetLoad = async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FLEET_TIMEOUT_MS);
@@ -894,7 +916,8 @@ export const AmdPlugin = async ({ client } = {}) => {
               throw gatewayError(400, "请至少填写一个 AMD TokenFactory API Key");
             }
             const baseURL = configuredBaseUrl || resolveBaseUrl();
-            const { pool, invalid, unknown } = await probePool(keys, baseURL);
+            const { results, pool, invalid, unknown } = await probePool(keys, baseURL);
+            await warmCatalogCache(results, pool, baseURL);
 
             const note = String(inputs?.note ?? "").trim();
             const accountId =
