@@ -401,6 +401,54 @@ describe("登录探活", () => {
     const start = await startLogin(plugin, { keys: "key-1234567890" });
     assert.equal(start.instructions, "已配置 AMD TokenFactory API key（key-123...7890）。");
   });
+
+  it("登录成功后立刻请求模型目录不再产生网络请求", async () => {
+    handler = probeHandler({});
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: KEY_A });
+    const afterLogin = requests.length;
+
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, afterLogin);
+  });
+
+  it("缓存键按最终入池的池计算，剔除无效 key 后仍能命中", async () => {
+    handler = probeHandler({ [KEY_A]: 401 });
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: KEY_A + "," + KEY_B });
+    const afterLogin = requests.length;
+
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_B]);
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, afterLogin);
+  });
+
+  it("模型目录无法解析时登录仍然成功，且不写入坏缓存", async () => {
+    handler = (req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("not-json");
+    };
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: KEY_A });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A]);
+    assert.equal(requests.length, 1);
+
+    handler = probeHandler({});
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, 2);
+  });
 });
 
 describe("请求链路与网关兼容层", () => {
