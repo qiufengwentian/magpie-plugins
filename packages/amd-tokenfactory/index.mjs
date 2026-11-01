@@ -381,6 +381,33 @@ async function cancelBody(response) {
   }
 }
 
+/**
+ * Read a response body as JSON with a hard deadline. When the deadline passes the
+ * body stream is released, so a stalled catalog response cannot hold its socket —
+ * or the sign-in awaiting it — open.
+ */
+async function readJsonWithTimeout(response, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const chunks = [];
+  try {
+    await response.body.pipeTo(
+      new WritableStream({
+        write(chunk) {
+          chunks.push(chunk);
+        },
+      }),
+      { signal: controller.signal },
+    );
+  } catch {
+    await cancelBody(response);
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
 async function fetchWithRetry(url, init = {}, maxRetryDelayMs = MAX_RETRY_DELAY_MS) {
   let lastError;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -688,9 +715,19 @@ export const AmdPlugin = async ({ client } = {}) => {
 
   const probePool = async (keys, baseURL) => {
     const results = await probeKeys(keys, baseURL);
-    const invalid = results.filter((result) => result.state === "invalid");
-    const unknown = results.filter((result) => result.state === "unknown");
-    const alive = results.filter((result) => result.state === "alive");
+    const alive = [];
+    const pool = [];
+    let invalidCount = 0;
+    let unknownCount = 0;
+    for (const result of results) {
+      if (result.state === "invalid") {
+        invalidCount++;
+        continue;
+      }
+      pool.push(result.key);
+      if (result.state === "alive") alive.push(result);
+      if (result.state === "unknown") unknownCount++;
+    }
 
     if (alive.length === 0) {
       if (keys.length === 1) {
@@ -703,7 +740,7 @@ export const AmdPlugin = async ({ client } = {}) => {
         }
         throw gatewayError(502, "key 校验失败：超时或网络异常");
       }
-      if (unknown.length === 0) {
+      if (unknownCount === 0) {
         throw authError("所有 " + keys.length + " 个 API Key 均无效或已过期，请重新登录");
       }
       throw gatewayError(
@@ -711,31 +748,31 @@ export const AmdPlugin = async ({ client } = {}) => {
         "key 探活失败：" +
           keys.length +
           " 个 key 均未通过（" +
-          invalid.length +
+          invalidCount +
           " 个无效，" +
-          unknown.length +
+          unknownCount +
           " 个未出结论）",
       );
     }
 
-    const pool = results.filter((result) => result.state !== "invalid").map((result) => result.key);
-    return { results, pool, invalid, unknown };
+    return { pool, alive, invalidCount, unknownCount };
   };
 
   /**
    * Reuse the probe responses as the model catalog: parse the first alive body and
    * seed the catalog cache under the final pool, so opening the model picker right
-   * after sign-in costs no extra request. Unused bodies are released and catalog
-   * failures stay silent — sign-in never depends on the catalog being readable.
+   * after sign-in costs no extra request. Unused bodies are released, reading the
+   * body is bounded by the probe timeout (a stalled response is dropped, never
+   * awaited forever), and catalog failures stay silent — sign-in never depends on
+   * the catalog being readable.
    */
-  const warmCatalogCache = async (results, pool, baseURL) => {
-    const alive = results.filter((result) => result.state === "alive");
+  const warmCatalogCache = async (alive, pool, baseURL) => {
     const [first, ...unused] = alive;
     await Promise.all(unused.map((result) => cancelBody(result.response)));
-    if (!first) return;
 
+    const timeoutMs = envDurationMs("AMD_TOKENFACTORY_PROBE_TIMEOUT_MS", PROBE_TIMEOUT_MS);
     try {
-      const payload = await first.response.json();
+      const payload = await readJsonWithTimeout(first.response, timeoutMs);
       if (catalogRows(payload).length > 0) {
         catalogCache.set(cacheKeyOf(baseURL, pool), { payload, fetchedAt: Date.now() });
       }
@@ -943,32 +980,32 @@ export const AmdPlugin = async ({ client } = {}) => {
               throw gatewayError(400, "请至少填写一个 AMD TokenFactory API Key");
             }
             const baseURL = configuredBaseUrl || resolveBaseUrl();
-            const { results, pool, invalid, unknown } = await probePool(keys, baseURL);
-            await warmCatalogCache(results, pool, baseURL);
+            const { pool, alive, invalidCount, unknownCount } = await probePool(keys, baseURL);
+            await warmCatalogCache(alive, pool, baseURL);
 
             const note = String(inputs?.note ?? "").trim();
             const accountId =
-              note || "AMD " + maskApiKey(pool[0]) + (pool.length > 1 ? " +" + (pool.length - 1) : "");
+              note || "AMD " + maskApiKey(pool[0]) + (pool.length > 1 ? " +" + pool.length : "");
             log(
               "已配置 " +
                 pool.length +
                 " 个 API key（剔除 " +
-                invalid.length +
+                invalidCount +
                 " 个，未验证 " +
-                unknown.length +
+                unknownCount +
                 " 个）",
             );
 
             const detail = [
-              invalid.length > 0 ? invalid.length + " 个无效已剔除" : "",
-              unknown.length > 0 ? unknown.length + " 个未验证" : "",
+              invalidCount > 0 ? invalidCount + " 个无效已剔除" : "",
+              unknownCount > 0 ? unknownCount + " 个未验证" : "",
             ].filter(Boolean);
 
             return {
               url: "",
               method: "auto",
               instructions:
-                keys.length > 1
+                pool.length > 1
                   ? "已配置 " +
                     pool.length +
                     " 个 AMD TokenFactory API key，请求将轮换使用。" +
