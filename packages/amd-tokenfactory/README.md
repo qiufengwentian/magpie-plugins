@@ -107,7 +107,7 @@ Fleet 负载查询最长等待 30 秒，结果缓存 5 分钟；失败或超时�
 | --- | --- | --- |
 | `AMD_TOKENFACTORY_BASE_URL` | https://developer.amd.com.cn/radeon/api/v1 | 覆盖 API Base URL |
 | `AMD_TOKENFACTORY_LOAD_URL` | https://developer.amd.com.cn/radeon/api/tokenfactory/load | 覆盖 Fleet 负载地址 |
-| `AMD_TOKENFACTORY_PROBE_TIMEOUT_MS` | 5000 | 单 key 探活超时（毫秒），仅用于测试压缩时间 |
+| `AMD_TOKENFACTORY_PROBE_TIMEOUT_MS` | 5000 | 单 key 探活超时（毫秒），同时也限制登录时复用探活响应读模型目录的时长；仅用于测试压缩时间 |
 | `AMD_TOKENFACTORY_PROBE_BUDGET_MS` | 10000 | 整轮探活总预算（毫秒），仅用于测试压缩时间 |
 
 前两个变量主要用于自建代理、镜像或本地 mock 测试；两个探活变量只用于测试压缩时间，未设置或填入非法值时回退默认值，默认值即生产值。

@@ -399,13 +399,13 @@ async function readJsonWithTimeout(response, timeoutMs) {
       }),
       { signal: controller.signal },
     );
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
     await cancelBody(response);
     return undefined;
   } finally {
     clearTimeout(timer);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 async function fetchWithRetry(url, init = {}, maxRetryDelayMs = MAX_RETRY_DELAY_MS) {
