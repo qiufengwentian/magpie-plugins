@@ -53,11 +53,24 @@ async function makePlugin() {
   return { plugin, config };
 }
 
-async function login(plugin, inputs) {
+async function startLogin(plugin, inputs) {
   const method = plugin.auth.methods[0];
   const start = await method.authorize(inputs);
   assert.equal(typeof start.callback, "function");
-  return start.callback();
+  return start;
+}
+
+async function login(plugin, inputs) {
+  return (await startLogin(plugin, inputs)).callback();
+}
+
+async function loginFailure(plugin, inputs) {
+  try {
+    await login(plugin, inputs);
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected login to fail");
 }
 
 async function makeLoader(plugin, provider, keys, accountId = "acct-1") {
@@ -68,6 +81,9 @@ let server;
 let baseUrl;
 let handler;
 let requests = [];
+
+const probeCountOf = (key) =>
+  requests.filter((request) => request.headers.authorization === "Bearer " + key).length;
 
 const defaultHandler = (req, res) => {
   sendJson(res, 404, { error: "not found" });
@@ -136,7 +152,7 @@ describe("config", () => {
 });
 
 describe("登录与 API Key 池", () => {
-  it("单 key 登录只校验第一个 key，并保存 JSON 数组", async () => {
+  it("单 key 登录只探活一次，并保存 JSON 数组", async () => {
     handler = (req, res) => {
       assert.equal(req.url, "/models");
       assert.equal(req.headers.authorization, "Bearer key-1234567890");
@@ -148,6 +164,7 @@ describe("登录与 API Key 池", () => {
     assert.deepEqual(JSON.parse(result.access), ["key-1234567890"]);
     assert.equal(result.refresh, "");
     assert.match(result.accountId, /^AMD key-123/);
+    assert.equal(result.accountId.includes("+"), false);
     assert.ok(!result.accountId.includes("1234567890"));
     assert.equal(requests.length, 1);
   });
@@ -161,8 +178,11 @@ describe("登录与 API Key 池", () => {
     });
     assert.deepEqual(JSON.parse(result.access), ["key-a", "key-b"]);
     assert.equal(result.accountId, "主力号");
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].headers.authorization, "Bearer key-a");
+    assert.equal(requests.length, 2);
+    assert.deepEqual(
+      requests.map((request) => request.headers.authorization).sort(),
+      ["Bearer key-a", "Bearer key-b"],
+    );
   });
 
   it("401/403 提示 API Key 无效或已过期", async () => {
@@ -216,6 +236,389 @@ describe("登录与 API Key 池", () => {
         return true;
       },
     );
+  });
+});
+
+describe("登录探活", () => {
+  const KEY_A = "key-aaaa-1111-1111";
+  const KEY_B = "key-bbbb-2222-2222";
+  const KEY_C = "key-cccc-3333-3333";
+  const MASK_A = "key-aaa...1111";
+
+  const probeHandler = (statusByKey) => (req, res) => {
+    const key = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
+    const status = statusByKey[key] ?? 200;
+    if (status === 200) sendJson(res, 200, { data: [{ id: "m1" }] });
+    else sendJson(res, status, { error: "HTTP " + status });
+  };
+
+  it("3 个 key 全部可用时各探活一次并全部入池", async () => {
+    handler = probeHandler({});
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B, KEY_C]);
+    assert.equal(requests.length, 3);
+    assert.equal(
+      requests.every((request) => request.url === "/models"),
+      true,
+    );
+    assert.equal(probeCountOf(KEY_A), 1);
+    assert.equal(probeCountOf(KEY_B), 1);
+    assert.equal(probeCountOf(KEY_C), 1);
+  });
+
+  it("第一个 key 401、第二个可用时登录成功并只保留第二个", async () => {
+    handler = probeHandler({ [KEY_A]: 401 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: KEY_A + "," + KEY_B });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_B]);
+    assert.equal(requests.length, 2);
+    assert.match(start.instructions, /^已配置 AMD TokenFactory API key（key-bbb/);
+    assert.equal(start.instructions.includes("轮换"), false);
+    assert.match(result.accountId, /key-bbb/);
+    assert.equal(result.accountId.includes("1111"), false);
+  });
+
+  it("中间 key 无效时入池保持用户输入顺序", async () => {
+    handler = probeHandler({ [KEY_B]: 401 });
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_C]);
+    assert.equal(requests.length, 3);
+  });
+
+  it("3 个 key 全部 401 时登录失效且不写凭据", async () => {
+    const { plugin } = await makePlugin();
+    handler = probeHandler({});
+    const existing = await login(plugin, { keys: KEY_A });
+
+    handler = probeHandler({ [KEY_A]: 401, [KEY_B]: 401, [KEY_C]: 401 });
+    requests = [];
+    let credential;
+    await assert.rejects(
+      async () => {
+        credential = await login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+      },
+      (error) => {
+        assert.equal(error.signIn, "expired");
+        assert.match(error.message, /所有 3 个 API Key 均无效或已过期/);
+        return true;
+      },
+    );
+    assert.equal(credential, undefined);
+    assert.equal(requests.length, 3);
+    assert.deepEqual(JSON.parse(existing.access), [KEY_A]);
+  });
+
+  it("一个可用加一个持续限流时两个都保留并提示未验证", async () => {
+    handler = probeHandler({ [KEY_B]: 429 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: KEY_A + "," + KEY_B });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B]);
+    assert.match(start.instructions, /未验证/);
+    assert.equal(probeCountOf(KEY_B), 3);
+  });
+
+  it("全部 502 时抛出网关错误并说明探活失败", async () => {
+    handler = probeHandler({ [KEY_A]: 502, [KEY_B]: 502, [KEY_C]: 502 });
+    const { plugin } = await makePlugin();
+    await assert.rejects(
+      () => login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") }),
+      (error) => {
+        assert.match(error.message, /key 探活失败/);
+        assert.notEqual(error.signIn, "expired");
+        return true;
+      },
+    );
+    assert.equal(requests.length, 9);
+  });
+
+  it("账号名与提示按实际入池数量生成", async () => {
+    handler = probeHandler({ [KEY_C]: 401 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B]);
+    assert.equal(result.accountId, "AMD " + MASK_A + " +2");
+    assert.equal(
+      start.instructions,
+      "已配置 2 个 AMD TokenFactory API key，请求将轮换使用。（1 个无效已剔除）",
+    );
+  });
+
+  it("剔除后只剩 1 个 key 时按实际入池数量给单 key 文案", async () => {
+    handler = probeHandler({ [KEY_A]: 401, [KEY_B]: 401 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_C]);
+    assert.match(start.instructions, /^已配置 AMD TokenFactory API key（key-ccc/);
+    assert.equal(start.instructions.includes("轮换"), false);
+    assert.match(result.accountId, /^AMD key-ccc/);
+    assert.equal(result.accountId.includes("+"), false);
+  });
+
+  it("探活并发上限为 4", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    handler = async (req, res) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      inFlight--;
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const keys = Array.from({ length: 6 }, (_, index) => "key-" + index + "-abcdefghijkl");
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: keys.join(",") });
+
+    assert.equal(JSON.parse(result.access).length, 6);
+    assert.equal(requests.length, 6);
+    assert.equal(peak, 4);
+  });
+
+  it("单 key 场景的四条错误文案与成功提示保持原样", async () => {
+    for (const status of [401, 403]) {
+      handler = (req, res) => sendJson(res, status, { error: "invalid" });
+      const { plugin } = await makePlugin();
+      const error = await loginFailure(plugin, { keys: KEY_A });
+      assert.equal(error.message, "API Key 无效或已过期（HTTP " + status + "）");
+      assert.equal(error.signIn, "expired");
+    }
+
+    handler = (req, res) => sendJson(res, 500, { error: "gateway" });
+    let { plugin } = await makePlugin();
+    let error = await loginFailure(plugin, { keys: KEY_A });
+    assert.equal(error.message, "key 校验失败：HTTP 500");
+    assert.notEqual(error.signIn, "expired");
+
+    handler = (req) => {
+      req.socket.destroy();
+    };
+    ({ plugin } = await makePlugin());
+    error = await loginFailure(plugin, { keys: KEY_A });
+    assert.equal(error.message, "key 校验失败：超时或网络异常");
+
+    ({ plugin } = await makePlugin());
+    error = await loginFailure(plugin, { keys: " , ; " });
+    assert.equal(error.message, "请至少填写一个 AMD TokenFactory API Key");
+
+    handler = (req, res) => sendJson(res, 200, { data: [{ id: "m1" }] });
+    ({ plugin } = await makePlugin());
+    const start = await startLogin(plugin, { keys: "key-1234567890" });
+    assert.equal(start.instructions, "已配置 AMD TokenFactory API key（key-123...7890）。");
+  });
+
+  it("登录成功后立刻请求模型目录不再产生网络请求", async () => {
+    handler = probeHandler({});
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: KEY_A });
+    const afterLogin = requests.length;
+
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, afterLogin);
+  });
+
+  it("缓存键按最终入池的池计算，剔除无效 key 后仍能命中", async () => {
+    handler = probeHandler({ [KEY_A]: 401 });
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: KEY_A + "," + KEY_B });
+    const afterLogin = requests.length;
+
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_B]);
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, afterLogin);
+  });
+
+  it("模型目录无法解析时登录仍然成功，且不写入坏缓存", async () => {
+    handler = (req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("not-json");
+    };
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: KEY_A });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A]);
+    assert.equal(requests.length, 1);
+
+    handler = probeHandler({});
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, 2);
+  });
+});
+
+describe("登录探活超时与总预算", () => {
+  const KEY_A = "probe-timeout-key-abcdefghijkl";
+  const PROBE_TIMEOUT_ENV = "AMD_TOKENFACTORY_PROBE_TIMEOUT_MS";
+  const PROBE_BUDGET_ENV = "AMD_TOKENFACTORY_PROBE_BUDGET_MS";
+
+  async function withProbeEnv(overrides, run) {
+    const saved = {};
+    for (const [name, value] of Object.entries(overrides)) {
+      saved[name] = process.env[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    try {
+      return await run();
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  it("单 key 超时后报超时或网络异常，不会无限等待", { timeout: 3000 }, async () => {
+    handler = () => {};
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const error = await withProbeEnv({ [PROBE_TIMEOUT_ENV]: "60" }, () =>
+      loginFailure(plugin, { keys: KEY_A }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(error.message, "key 校验失败：超时或网络异常");
+    assert.notEqual(error.signIn, "expired");
+    assert.equal(requests.length, 1);
+    assert.ok(elapsed >= 50, "应等待压缩后的单 key 超时（实际 " + elapsed + "ms）");
+    assert.ok(elapsed < 2000, "不应无限等待（实际 " + elapsed + "ms）");
+  });
+
+  it("目录预热读 body 卡住时按探活超时放弃预热，登录仍成功", { timeout: 4000 }, async () => {
+    handler = (req, res) => {
+      res.writeHead(200, { "content-type": "application/json", "content-length": "1048576" });
+      res.write('{"data":[');
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const result = await withProbeEnv({ [PROBE_TIMEOUT_ENV]: "100" }, () =>
+      login(plugin, { keys: KEY_A }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(result.type, "success");
+    assert.ok(elapsed < 2000, "读 body 必须有上限（实际 " + elapsed + "ms）");
+
+    handler = (req, res) => sendJson(res, 200, { data: [{ id: "m1" }] });
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, 2);
+  });
+
+  it("总预算到点后未开工的 key 记为未验证且不再发请求", { timeout: 5000 }, async () => {
+    const keys = Array.from(
+      { length: 6 },
+      (_, index) => "probe-budget-key-" + index + "-abcdefghijkl",
+    );
+    handler = async (req, res) => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const { start, result } = await withProbeEnv({ [PROBE_BUDGET_ENV]: "50" }, async () => {
+      const start = await startLogin(plugin, { keys: keys.join(",") });
+      return { start, result: await start.callback() };
+    });
+    const elapsed = Date.now() - started;
+
+    assert.deepEqual(JSON.parse(result.access), keys);
+    assert.match(start.instructions, /2 个未验证/);
+    assert.equal(requests.length, 4);
+    assert.equal(probeCountOf(keys[4]), 0);
+    assert.equal(probeCountOf(keys[5]), 0);
+    assert.ok(elapsed < 1500, "预算到点后不应等待未开工的 key（实际 " + elapsed + "ms）");
+  });
+
+  it("503 两次后第三次成功：退避封顶 1 秒，总耗时落在单 key 超时内", { timeout: 8000 }, async () => {
+    let attempts = 0;
+    handler = (req, res) => {
+      attempts++;
+      if (attempts < 3) {
+        sendJson(res, 503, { error: "busy" }, { "retry-after": "3" });
+        return;
+      }
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const result = await withProbeEnv(
+      { [PROBE_TIMEOUT_ENV]: undefined, [PROBE_BUDGET_ENV]: undefined },
+      () => login(plugin, { keys: KEY_A }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(result.type, "success");
+    assert.equal(attempts, 3);
+    assert.ok(elapsed < 5000, "3 次尝试应落在 5 秒单 key 超时内（实际 " + elapsed + "ms）");
+  });
+
+  it("环境变量缺失时按生产默认值探活，不提前超时也不跳过 key", { timeout: 5000 }, async () => {
+    const keys = Array.from(
+      { length: 5 },
+      (_, index) => "probe-default-key-" + index + "-abcdefghijkl",
+    );
+    handler = async (req, res) => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const { plugin } = await makePlugin();
+    const result = await withProbeEnv(
+      { [PROBE_TIMEOUT_ENV]: undefined, [PROBE_BUDGET_ENV]: undefined },
+      () => login(plugin, { keys: keys.join(",") }),
+    );
+
+    assert.deepEqual(JSON.parse(result.access), keys);
+    assert.equal(requests.length, 5);
+  });
+
+  it("模型目录请求的退避仍按 30 秒封顶，不受探活 1 秒封顶影响", { timeout: 8000 }, async () => {
+    let attempts = 0;
+    handler = (req, res) => {
+      attempts++;
+      if (attempts === 1) {
+        sendJson(res, 503, { error: "busy" }, { "retry-after": "2" });
+        return;
+      }
+      sendJson(res, 200, {
+        data: [
+          { id: "m1", architecture: { input_modalities: ["text"], output_modalities: ["text"] } },
+        ],
+      });
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const models = await withProbeEnv(
+      { [PROBE_TIMEOUT_ENV]: undefined, [PROBE_BUDGET_ENV]: undefined },
+      () => plugin.provider.models(makeProvider(), { auth: makeAuth(["catalog-retry-key"]) }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(models.m1.id, "m1");
+    assert.equal(attempts, 2);
+    assert.ok(elapsed >= 1500, "模型目录路径应尊重 Retry-After 2 秒（实际 " + elapsed + "ms）");
   });
 });
 

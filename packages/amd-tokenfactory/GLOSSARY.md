@@ -12,7 +12,11 @@ AMD TokenFactory 提供给多个用户共享使用的公开免费模型。插件
 
 ## API Key Pool
 
-一个 magpie 账号内保存的一组 AMD API Key。请求按轮询顺序使用这些 key；遇到 401、403 或 429 时切换到下一个 key。
+一个 magpie 账号内保存的一组 AMD API Key。请求按轮询顺序使用这些 key；遇到 401、403 或 429 时切换到下一个 key。登录时被判定无效的 key 不进入池。
+
+## Key Probe
+
+登录时对每个 API Key 单独做的一次可达性校验，用上游返回的 HTTP 状态把它判为存活、无效或未验证。只有判为无效的 key 会被剔除，存活与未验证的 key 都留在池内。
 
 ## Fleet Load
 

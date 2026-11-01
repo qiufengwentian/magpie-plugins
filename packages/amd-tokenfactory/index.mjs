@@ -25,6 +25,11 @@ const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
 
+const PROBE_CONCURRENCY = 4;
+const PROBE_TIMEOUT_MS = 5 * 1000;
+const PROBE_BUDGET_MS = 10 * 1000;
+const PROBE_MAX_RETRY_DELAY_MS = 1000;
+
 const DEFAULT_CONTEXT_WINDOW = 131072;
 const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 const THINKING_MIN_OUTPUT_TOKENS = 16384;
@@ -71,6 +76,11 @@ function resolveBaseUrl(provider) {
 
 function resolveLoadUrl() {
   return trimSlash(process.env.AMD_TOKENFACTORY_LOAD_URL) || DEFAULT_LOAD_URL;
+}
+
+function envDurationMs(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function isPlainObject(value) {
@@ -336,12 +346,12 @@ function getRetryAfterMs(response) {
   return delta > 0 ? delta : undefined;
 }
 
-function calculateRetryDelay(attempt, retryAfter) {
+function calculateRetryDelay(attempt, retryAfter, maxDelayMs = MAX_RETRY_DELAY_MS) {
   if (retryAfter !== undefined && retryAfter > 0) {
-    return Math.min(Math.round(retryAfter * (0.9 + Math.random() * 0.2)), MAX_RETRY_DELAY_MS);
+    return Math.min(Math.round(retryAfter * (0.9 + Math.random() * 0.2)), maxDelayMs);
   }
   const exponential = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-  return Math.round(Math.random() * Math.min(exponential, MAX_RETRY_DELAY_MS));
+  return Math.round(Math.random() * Math.min(exponential, maxDelayMs));
 }
 
 function sleep(ms, signal) {
@@ -371,7 +381,34 @@ async function cancelBody(response) {
   }
 }
 
-async function fetchWithRetry(url, init = {}) {
+/**
+ * Read a response body as JSON with a hard deadline. When the deadline passes the
+ * body stream is released, so a stalled catalog response cannot hold its socket —
+ * or the sign-in awaiting it — open.
+ */
+async function readJsonWithTimeout(response, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const chunks = [];
+  try {
+    await response.body.pipeTo(
+      new WritableStream({
+        write(chunk) {
+          chunks.push(chunk);
+        },
+      }),
+      { signal: controller.signal },
+    );
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    await cancelBody(response);
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithRetry(url, init = {}, maxRetryDelayMs = MAX_RETRY_DELAY_MS) {
   let lastError;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
@@ -381,12 +418,12 @@ async function fetchWithRetry(url, init = {}) {
       if (attempt === MAX_ATTEMPTS - 1) return response;
       const retryAfter = getRetryAfterMs(response);
       await cancelBody(response);
-      await sleep(calculateRetryDelay(attempt, retryAfter), init.signal);
+      await sleep(calculateRetryDelay(attempt, retryAfter, maxRetryDelayMs), init.signal);
     } catch (error) {
       if (init.signal?.aborted) throw error;
       lastError = error;
       if (attempt < MAX_ATTEMPTS - 1) {
-        await sleep(calculateRetryDelay(attempt), init.signal);
+        await sleep(calculateRetryDelay(attempt, undefined, maxRetryDelayMs), init.signal);
       }
     }
   }
@@ -401,6 +438,69 @@ function gatewayError(status, message) {
 
 function authError(message) {
   return Object.assign(gatewayError(401, message), { signIn: "expired" });
+}
+
+/**
+ * Probe one API key with a single GET /models request. The verdict is decided by
+ * the HTTP status only: 2xx alive, 401/403 invalid, everything else unverified.
+ * Alive results carry the raw response so the model catalog can be reused later
+ * without a second request.
+ */
+async function probeKey(key, baseURL) {
+  const timeoutMs = envDurationMs("AMD_TOKENFACTORY_PROBE_TIMEOUT_MS", PROBE_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetchWithRetry(
+      trimSlash(baseURL) + "/models",
+      {
+        method: "GET",
+        headers: {
+          Authorization: "Bearer " + key,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+      },
+      PROBE_MAX_RETRY_DELAY_MS,
+    );
+  } catch {
+    return { key, state: "unknown" };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const status = response.status;
+  if (response.ok) return { key, state: "alive", status, response };
+  await cancelBody(response);
+  if (status === 401 || status === 403) return { key, state: "invalid", status };
+  return { key, state: "unknown", status };
+}
+
+/**
+ * Probe every key in the pool, keeping at most PROBE_CONCURRENCY requests in
+ * flight. Results keep the input order. Keys that have not started when the
+ * total budget runs out are reported as unverified without a request.
+ */
+async function probeKeys(keys, baseURL) {
+  const results = new Array(keys.length);
+  const deadline = Date.now() + envDurationMs("AMD_TOKENFACTORY_PROBE_BUDGET_MS", PROBE_BUDGET_MS);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < keys.length) {
+      if (Date.now() >= deadline) {
+        while (nextIndex < keys.length) {
+          const index = nextIndex++;
+          results[index] = { key: keys[index], state: "unknown" };
+        }
+        return;
+      }
+      const index = nextIndex++;
+      results[index] = await probeKey(keys[index], baseURL);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, keys.length) }, worker));
+  return results;
 }
 
 function summarizeFleetLoad(load) {
@@ -613,41 +713,72 @@ export const AmdPlugin = async ({ client } = {}) => {
     throw lastError ?? gatewayError(502, "模型目录查询失败");
   };
 
-  const validateFirstKey = async (keys, baseURL) => {
-    let response;
-    try {
-      response = await fetchWithRetry(trimSlash(baseURL) + "/models", {
-        method: "GET",
-        headers: {
-          Authorization: "Bearer " + keys[0],
-          "Content-Type": "application/json",
-        },
-      });
-    } catch (error) {
-      throw gatewayError(502, "网络请求失败（网络错误）：" + (error?.message ?? error));
+  const probePool = async (keys, baseURL) => {
+    const results = await probeKeys(keys, baseURL);
+    const alive = [];
+    const pool = [];
+    let invalidCount = 0;
+    let unknownCount = 0;
+    for (const result of results) {
+      if (result.state === "invalid") {
+        invalidCount++;
+        continue;
+      }
+      pool.push(result.key);
+      if (result.state === "alive") alive.push(result);
+      if (result.state === "unknown") unknownCount++;
     }
 
-    if (response.status === 401 || response.status === 403) {
-      await cancelBody(response);
-      throw authError("API Key 无效或已过期（HTTP " + response.status + "）");
-    }
-    if (!response.ok) {
-      const status = response.status;
-      await cancelBody(response);
-      throw gatewayError(status, "key 校验失败：HTTP " + status);
+    if (alive.length === 0) {
+      if (keys.length === 1) {
+        const [only] = results;
+        if (only.state === "invalid") {
+          throw authError("API Key 无效或已过期（HTTP " + only.status + "）");
+        }
+        if (only.status !== undefined) {
+          throw gatewayError(only.status, "key 校验失败：HTTP " + only.status);
+        }
+        throw gatewayError(502, "key 校验失败：超时或网络异常");
+      }
+      if (unknownCount === 0) {
+        throw authError("所有 " + keys.length + " 个 API Key 均无效或已过期，请重新登录");
+      }
+      throw gatewayError(
+        502,
+        "key 探活失败：" +
+          keys.length +
+          " 个 key 均未通过（" +
+          invalidCount +
+          " 个无效，" +
+          unknownCount +
+          " 个未出结论）",
+      );
     }
 
-    let payload;
+    return { pool, alive, invalidCount, unknownCount };
+  };
+
+  /**
+   * Reuse the probe responses as the model catalog: parse the first alive body and
+   * seed the catalog cache under the final pool, so opening the model picker right
+   * after sign-in costs no extra request. Unused bodies are released, reading the
+   * body is bounded by the probe timeout (a stalled response is dropped, never
+   * awaited forever), and catalog failures stay silent — sign-in never depends on
+   * the catalog being readable.
+   */
+  const warmCatalogCache = async (alive, pool, baseURL) => {
+    const [first, ...unused] = alive;
+    await Promise.all(unused.map((result) => cancelBody(result.response)));
+
+    const timeoutMs = envDurationMs("AMD_TOKENFACTORY_PROBE_TIMEOUT_MS", PROBE_TIMEOUT_MS);
     try {
-      payload = await response.json();
+      const payload = await readJsonWithTimeout(first.response, timeoutMs);
+      if (catalogRows(payload).length > 0) {
+        catalogCache.set(cacheKeyOf(baseURL, pool), { payload, fetchedAt: Date.now() });
+      }
     } catch {
-      throw gatewayError(502, "模型目录返回的 JSON 无法解析");
+      // An unreadable catalog must not block sign-in; provider.models refetches on its own.
     }
-    if (catalogRows(payload).length === 0) {
-      throw gatewayError(502, "key 有效但模型目录为空或格式无法识别");
-    }
-    catalogCache.set(cacheKeyOf(baseURL, keys), { payload, fetchedAt: Date.now() });
-    return payload;
   };
 
   const fetchFleetLoad = async () => {
@@ -849,23 +980,40 @@ export const AmdPlugin = async ({ client } = {}) => {
               throw gatewayError(400, "请至少填写一个 AMD TokenFactory API Key");
             }
             const baseURL = configuredBaseUrl || resolveBaseUrl();
-            await validateFirstKey(keys, baseURL);
+            const { pool, alive, invalidCount, unknownCount } = await probePool(keys, baseURL);
+            await warmCatalogCache(alive, pool, baseURL);
 
             const note = String(inputs?.note ?? "").trim();
             const accountId =
-              note || "AMD " + maskApiKey(keys[0]) + (keys.length > 1 ? " +" + (keys.length - 1) : "");
-            log("已配置 " + keys.length + " 个 API key");
+              note || "AMD " + maskApiKey(pool[0]) + (pool.length > 1 ? " +" + pool.length : "");
+            log(
+              "已配置 " +
+                pool.length +
+                " 个 API key（剔除 " +
+                invalidCount +
+                " 个，未验证 " +
+                unknownCount +
+                " 个）",
+            );
+
+            const detail = [
+              invalidCount > 0 ? invalidCount + " 个无效已剔除" : "",
+              unknownCount > 0 ? unknownCount + " 个未验证" : "",
+            ].filter(Boolean);
 
             return {
               url: "",
               method: "auto",
               instructions:
-                keys.length > 1
-                  ? "已配置 " + keys.length + " 个 AMD TokenFactory API key，请求将轮换使用。"
-                  : "已配置 AMD TokenFactory API key（" + maskApiKey(keys[0]) + "）。",
+                pool.length > 1
+                  ? "已配置 " +
+                    pool.length +
+                    " 个 AMD TokenFactory API key，请求将轮换使用。" +
+                    (detail.length > 0 ? "（" + detail.join("，") + "）" : "")
+                  : "已配置 AMD TokenFactory API key（" + maskApiKey(pool[0]) + "）。",
               callback: async () => ({
                 type: "success",
-                access: serializeKeyPool(keys),
+                access: serializeKeyPool(pool),
                 refresh: "",
                 accountId,
               }),
