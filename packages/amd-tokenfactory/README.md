@@ -60,7 +60,7 @@ magpie plugin add /path/to/magpie-plugins/packages/amd-tokenfactory
 - 单 key 超时或网络异常：**key 校验失败：超时或网络异常**；
 - 空输入：**请至少填写一个 AMD TokenFactory API Key**。
 
-登录成功提示的是**实际入池数量**：多 key 为 **已配置 N 个 AMD TokenFactory API key，请求将轮换使用。**，有剔除或未验证时追加 **（K 个无效已剔除，J 个未验证）**，只列非零项；单 key 为 **已配置 AMD TokenFactory API key（掩码）。**。账号名默认取池中第一个 key 的掩码，入池多于 1 个时追加 `+N`；填了备注名则用备注。
+登录成功提示的是**实际入池数量**：多 key 为 **已配置 N 个 AMD TokenFactory API key，请求将轮换使用。**，有剔除或未验证时追加 **（K 个无效已剔除，J 个未验证）**，只列非零项；单 key 为 **已配置 AMD TokenFactory API key（掩码）。**。账号名默认取池中第一个 key 的掩码，入池多于 1 个时追加 `+N`（N 为实际入池数量）；填了备注名则用备注。
 
 探活中第一个存活 key 返回的模型列表会直接写入目录缓存（10 分钟），所以登录成功后立刻打开模型选择器不会再多发一次 `GET /models`；目录解析失败或为空时静默跳过，不影响登录结果。
 

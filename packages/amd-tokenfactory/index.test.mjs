@@ -82,6 +82,9 @@ let baseUrl;
 let handler;
 let requests = [];
 
+const probeCountOf = (key) =>
+  requests.filter((request) => request.headers.authorization === "Bearer " + key).length;
+
 const defaultHandler = (req, res) => {
   sendJson(res, 404, { error: "not found" });
 };
@@ -161,6 +164,7 @@ describe("登录与 API Key 池", () => {
     assert.deepEqual(JSON.parse(result.access), ["key-1234567890"]);
     assert.equal(result.refresh, "");
     assert.match(result.accountId, /^AMD key-123/);
+    assert.equal(result.accountId.includes("+"), false);
     assert.ok(!result.accountId.includes("1234567890"));
     assert.equal(requests.length, 1);
   });
@@ -248,9 +252,6 @@ describe("登录探活", () => {
     else sendJson(res, status, { error: "HTTP " + status });
   };
 
-  const probeCountOf = (key) =>
-    requests.filter((request) => request.headers.authorization === "Bearer " + key).length;
-
   it("3 个 key 全部可用时各探活一次并全部入池", async () => {
     handler = probeHandler({});
     const { plugin } = await makePlugin();
@@ -275,7 +276,8 @@ describe("登录探活", () => {
 
     assert.deepEqual(JSON.parse(result.access), [KEY_B]);
     assert.equal(requests.length, 2);
-    assert.match(start.instructions, /（1 个无效已剔除）/);
+    assert.match(start.instructions, /^已配置 AMD TokenFactory API key（key-bbb/);
+    assert.equal(start.instructions.includes("轮换"), false);
     assert.match(result.accountId, /key-bbb/);
     assert.equal(result.accountId.includes("1111"), false);
   });
@@ -344,11 +346,24 @@ describe("登录探活", () => {
     const result = await start.callback();
 
     assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B]);
-    assert.equal(result.accountId, "AMD " + MASK_A + " +1");
+    assert.equal(result.accountId, "AMD " + MASK_A + " +2");
     assert.equal(
       start.instructions,
       "已配置 2 个 AMD TokenFactory API key，请求将轮换使用。（1 个无效已剔除）",
     );
+  });
+
+  it("剔除后只剩 1 个 key 时按实际入池数量给单 key 文案", async () => {
+    handler = probeHandler({ [KEY_A]: 401, [KEY_B]: 401 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_C]);
+    assert.match(start.instructions, /^已配置 AMD TokenFactory API key（key-ccc/);
+    assert.equal(start.instructions.includes("轮换"), false);
+    assert.match(result.accountId, /^AMD key-ccc/);
+    assert.equal(result.accountId.includes("+"), false);
   });
 
   it("探活并发上限为 4", async () => {
@@ -473,9 +488,6 @@ describe("登录探活超时与总预算", () => {
     }
   }
 
-  const probeCountOf = (key) =>
-    requests.filter((request) => request.headers.authorization === "Bearer " + key).length;
-
   it("单 key 超时后报超时或网络异常，不会无限等待", { timeout: 3000 }, async () => {
     handler = () => {};
     const { plugin } = await makePlugin();
@@ -490,6 +502,29 @@ describe("登录探活超时与总预算", () => {
     assert.equal(requests.length, 1);
     assert.ok(elapsed >= 50, "应等待压缩后的单 key 超时（实际 " + elapsed + "ms）");
     assert.ok(elapsed < 2000, "不应无限等待（实际 " + elapsed + "ms）");
+  });
+
+  it("目录预热读 body 卡住时按探活超时放弃预热，登录仍成功", { timeout: 4000 }, async () => {
+    handler = (req, res) => {
+      res.writeHead(200, { "content-type": "application/json", "content-length": "1048576" });
+      res.write('{"data":[');
+    };
+    const { plugin } = await makePlugin();
+    const started = Date.now();
+    const result = await withProbeEnv({ [PROBE_TIMEOUT_ENV]: "100" }, () =>
+      login(plugin, { keys: KEY_A }),
+    );
+    const elapsed = Date.now() - started;
+
+    assert.equal(result.type, "success");
+    assert.ok(elapsed < 2000, "读 body 必须有上限（实际 " + elapsed + "ms）");
+
+    handler = (req, res) => sendJson(res, 200, { data: [{ id: "m1" }] });
+    const models = await plugin.provider.models(makeProvider(), {
+      auth: { access: result.access, accountId: result.accountId },
+    });
+    assert.equal(models.m1.id, "m1");
+    assert.equal(requests.length, 2);
   });
 
   it("总预算到点后未开工的 key 记为未验证且不再发请求", { timeout: 5000 }, async () => {
