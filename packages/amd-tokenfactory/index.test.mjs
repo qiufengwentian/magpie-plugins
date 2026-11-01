@@ -53,11 +53,24 @@ async function makePlugin() {
   return { plugin, config };
 }
 
-async function login(plugin, inputs) {
+async function startLogin(plugin, inputs) {
   const method = plugin.auth.methods[0];
   const start = await method.authorize(inputs);
   assert.equal(typeof start.callback, "function");
-  return start.callback();
+  return start;
+}
+
+async function login(plugin, inputs) {
+  return (await startLogin(plugin, inputs)).callback();
+}
+
+async function loginFailure(plugin, inputs) {
+  try {
+    await login(plugin, inputs);
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected login to fail");
 }
 
 async function makeLoader(plugin, provider, keys, accountId = "acct-1") {
@@ -136,7 +149,7 @@ describe("config", () => {
 });
 
 describe("登录与 API Key 池", () => {
-  it("单 key 登录只校验第一个 key，并保存 JSON 数组", async () => {
+  it("单 key 登录只探活一次，并保存 JSON 数组", async () => {
     handler = (req, res) => {
       assert.equal(req.url, "/models");
       assert.equal(req.headers.authorization, "Bearer key-1234567890");
@@ -161,8 +174,11 @@ describe("登录与 API Key 池", () => {
     });
     assert.deepEqual(JSON.parse(result.access), ["key-a", "key-b"]);
     assert.equal(result.accountId, "主力号");
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].headers.authorization, "Bearer key-a");
+    assert.equal(requests.length, 2);
+    assert.deepEqual(
+      requests.map((request) => request.headers.authorization).sort(),
+      ["Bearer key-a", "Bearer key-b"],
+    );
   });
 
   it("401/403 提示 API Key 无效或已过期", async () => {
@@ -216,6 +232,174 @@ describe("登录与 API Key 池", () => {
         return true;
       },
     );
+  });
+});
+
+describe("登录探活", () => {
+  const KEY_A = "key-aaaa-1111-1111";
+  const KEY_B = "key-bbbb-2222-2222";
+  const KEY_C = "key-cccc-3333-3333";
+  const MASK_A = "key-aaa...1111";
+
+  const probeHandler = (statusByKey) => (req, res) => {
+    const key = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
+    const status = statusByKey[key] ?? 200;
+    if (status === 200) sendJson(res, 200, { data: [{ id: "m1" }] });
+    else sendJson(res, status, { error: "HTTP " + status });
+  };
+
+  const probeCountOf = (key) =>
+    requests.filter((request) => request.headers.authorization === "Bearer " + key).length;
+
+  it("3 个 key 全部可用时各探活一次并全部入池", async () => {
+    handler = probeHandler({});
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B, KEY_C]);
+    assert.equal(requests.length, 3);
+    assert.equal(
+      requests.every((request) => request.url === "/models"),
+      true,
+    );
+    assert.equal(probeCountOf(KEY_A), 1);
+    assert.equal(probeCountOf(KEY_B), 1);
+    assert.equal(probeCountOf(KEY_C), 1);
+  });
+
+  it("第一个 key 401、第二个可用时登录成功并只保留第二个", async () => {
+    handler = probeHandler({ [KEY_A]: 401 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: KEY_A + "," + KEY_B });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_B]);
+    assert.equal(requests.length, 2);
+    assert.match(start.instructions, /（1 个无效已剔除）/);
+    assert.match(result.accountId, /key-bbb/);
+    assert.equal(result.accountId.includes("1111"), false);
+  });
+
+  it("中间 key 无效时入池保持用户输入顺序", async () => {
+    handler = probeHandler({ [KEY_B]: 401 });
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_C]);
+    assert.equal(requests.length, 3);
+  });
+
+  it("3 个 key 全部 401 时登录失效且不写凭据", async () => {
+    const { plugin } = await makePlugin();
+    handler = probeHandler({});
+    const existing = await login(plugin, { keys: KEY_A });
+
+    handler = probeHandler({ [KEY_A]: 401, [KEY_B]: 401, [KEY_C]: 401 });
+    requests = [];
+    let credential;
+    await assert.rejects(
+      async () => {
+        credential = await login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+      },
+      (error) => {
+        assert.equal(error.signIn, "expired");
+        assert.match(error.message, /所有 3 个 API Key 均无效或已过期/);
+        return true;
+      },
+    );
+    assert.equal(credential, undefined);
+    assert.equal(requests.length, 3);
+    assert.deepEqual(JSON.parse(existing.access), [KEY_A]);
+  });
+
+  it("一个可用加一个持续限流时两个都保留并提示未验证", async () => {
+    handler = probeHandler({ [KEY_B]: 429 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: KEY_A + "," + KEY_B });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B]);
+    assert.match(start.instructions, /未验证/);
+    assert.equal(probeCountOf(KEY_B), 3);
+  });
+
+  it("全部 502 时抛出网关错误并说明探活失败", async () => {
+    handler = probeHandler({ [KEY_A]: 502, [KEY_B]: 502, [KEY_C]: 502 });
+    const { plugin } = await makePlugin();
+    await assert.rejects(
+      () => login(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") }),
+      (error) => {
+        assert.match(error.message, /key 探活失败/);
+        assert.notEqual(error.signIn, "expired");
+        return true;
+      },
+    );
+    assert.equal(requests.length, 9);
+  });
+
+  it("账号名与提示按实际入池数量生成", async () => {
+    handler = probeHandler({ [KEY_C]: 401 });
+    const { plugin } = await makePlugin();
+    const start = await startLogin(plugin, { keys: [KEY_A, KEY_B, KEY_C].join(",") });
+    const result = await start.callback();
+
+    assert.deepEqual(JSON.parse(result.access), [KEY_A, KEY_B]);
+    assert.equal(result.accountId, "AMD " + MASK_A + " +1");
+    assert.equal(
+      start.instructions,
+      "已配置 2 个 AMD TokenFactory API key，请求将轮换使用。（1 个无效已剔除）",
+    );
+  });
+
+  it("探活并发上限为 4", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    handler = async (req, res) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      inFlight--;
+      sendJson(res, 200, { data: [{ id: "m1" }] });
+    };
+    const keys = Array.from({ length: 6 }, (_, index) => "key-" + index + "-abcdefghijkl");
+    const { plugin } = await makePlugin();
+    const result = await login(plugin, { keys: keys.join(",") });
+
+    assert.equal(JSON.parse(result.access).length, 6);
+    assert.equal(requests.length, 6);
+    assert.equal(peak, 4);
+  });
+
+  it("单 key 场景的四条错误文案与成功提示保持原样", async () => {
+    for (const status of [401, 403]) {
+      handler = (req, res) => sendJson(res, status, { error: "invalid" });
+      const { plugin } = await makePlugin();
+      const error = await loginFailure(plugin, { keys: KEY_A });
+      assert.equal(error.message, "API Key 无效或已过期（HTTP " + status + "）");
+      assert.equal(error.signIn, "expired");
+    }
+
+    handler = (req, res) => sendJson(res, 500, { error: "gateway" });
+    let { plugin } = await makePlugin();
+    let error = await loginFailure(plugin, { keys: KEY_A });
+    assert.equal(error.message, "key 校验失败：HTTP 500");
+    assert.notEqual(error.signIn, "expired");
+
+    handler = (req) => {
+      req.socket.destroy();
+    };
+    ({ plugin } = await makePlugin());
+    error = await loginFailure(plugin, { keys: KEY_A });
+    assert.equal(error.message, "key 校验失败：超时或网络异常");
+
+    ({ plugin } = await makePlugin());
+    error = await loginFailure(plugin, { keys: " , ; " });
+    assert.equal(error.message, "请至少填写一个 AMD TokenFactory API Key");
+
+    handler = (req, res) => sendJson(res, 200, { data: [{ id: "m1" }] });
+    ({ plugin } = await makePlugin());
+    const start = await startLogin(plugin, { keys: "key-1234567890" });
+    assert.equal(start.instructions, "已配置 AMD TokenFactory API key（key-123...7890）。");
   });
 });
 
