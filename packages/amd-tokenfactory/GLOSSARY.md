@@ -14,6 +14,10 @@ AMD TokenFactory 提供给多个用户共享使用的公开免费模型。插件
 
 一个 magpie 账号内保存的一组 AMD API Key。请求按轮询顺序使用这些 key；遇到 401、403 或 429 时切换到下一个 key。
 
+## Key Probe
+
+登录时对每个 API Key 单独做的一次可达性校验，用上游返回的 HTTP 状态把它判为存活、无效或未验证。只有判为无效的 key 会被剔除，存活与未验证的 key 都留在池内。
+
 ## Fleet Load
 
 AMD TokenFactory 的 `/tokenfactory/load` 接口返回的模型队列负载快照。每个模型条目使用 state（idle、busy、full）和 utilization 表示当前负载；插件把它汇总为可用、总数、Busy、满载和平均利用率。
